@@ -12,7 +12,7 @@ class OIMAS_N(object):
                  Bmax = 2.5, Dmax = .55, Dmin = 0., D = .55,
                  theta_Bmin = 0, day_peak = 244, phase = 56,
                  ups_Gmax = 0.0138, nu_Gmin = 0,
-                 theta_bg = -6.8, Dmbm = 4.8,
+                 theta_bg = -6.8, Dmbm = 4.8, root_to_shoot = None,
                  gamma = .11, kappa = .11, lamda = .11,
                  Kla0 = .17, Kre0 = .001, mu_la = 1e6, mu_re = 1e6,
                  chi_la = .32, chi_re = .5,
@@ -106,6 +106,7 @@ class OIMAS_N(object):
         self.phase          = phase                 # phase shift between biomass accumulation and growth curves (days)
         self.theta_bg       = theta_bg              # linear coefficient of the relation between the roots:shoots ratio and the depth below MHHW
         self.Dmbm           = Dmbm                  # intercept of root-shoot ratio equation
+        self.root_to_shoot  = root_to_shoot         # root:shoot ratio, as alternative for theta_bg and Dmbm
         self.gamma          = gamma                 # scale depth for below-ground biomass decay (m)
         self.kappa          = kappa                 # scale depth for mortality decay profile (m)
         self.lamda          = lamda                 # scale depth for growth decay profile (m)
@@ -120,7 +121,7 @@ class OIMAS_N(object):
         self.chi_re         = chi_re                # fraction of mortality routed to labile-slow carbon pool
         self.f_C            = f_C                   # carbon fraction of dry biomass (dimensionless)
 
-    def initialize_layers(self, init_min_mass, init_om_mass, f_Cla = None):
+    def initialize_layers(self, init_min_mass, init_om_mass, f_Cla = None, initial_surface = 0.0):
         """
         Initialize the layers with mineral and organic masses.
 
@@ -162,6 +163,10 @@ class OIMAS_N(object):
         # depth of center of layers
         self.d              = np.cumsum(self.thickness) - self.thickness / 2
 
+        # calculate biomass
+        self.biomass()
+        self.mass           += self.bbg[:,-1]
+
         # set base level
         self.baselevel      = -1 * np.sum(self.thickness)
 
@@ -187,9 +192,13 @@ class OIMAS_N(object):
         self.compaction()
 
         # update base level after first compaction to start from surface at zero
-        self.baselevel      -= self.surface
-        self.z              -= self.surface
-        self.surface        = 0
+        delta = initial_surface - self.surface
+        self.baselevel += delta
+        self.z += delta
+        self.surface = initial_surface
+
+        # initialize age horizons list
+        self.age_horizons = [{'t': self.t, 'cum_min_mass': 0.0}]
 
     def calculate_buoyant_weight(self):
 
@@ -231,7 +240,8 @@ class OIMAS_N(object):
             self.E              = E_min * (1 - Pom) + E_om * Pom
 
             # update the dry bulk density
-            rho_bulk            = (self.rho_om * (self.om_mass / self.mass) + self.rho_min * (self.min_mass / self.mass)) / (1 + self.E)
+            rho_bulk            = (self.rho_om * ((self.om_mass + self.bbg[:,-1]) / self.mass) + self.rho_min * (self.min_mass / self.mass)) / (1 + self.E)
+
             # calculation of tickness
             self.thickness      = self.mass / rho_bulk
 
@@ -326,8 +336,16 @@ class OIMAS_N(object):
         # Below-ground vegetation
         # ========================== #
 
+        # root-to-shoot ratio
+        if self.root_to_shoot is None:
+            root_to_shoot           = self.theta_bg * self.D + self.Dmbm
+            Bbg                     = Bag * root_to_shoot
+        else:
+            root_to_shoot           = self.root_to_shoot(days)
+            Bbg                     = Bp * root_to_shoot
+
         # total below-ground biomass (kg m^-2)
-        Bbg                     = Bag * (self.theta_bg * self.D + self.Dmbm)
+
         Bbg_extra_day           = Bag_extra_day * (self.theta_bg * self.D + self.Dmbm)
         # below-ground biomass over time (kg m^-2 day^-1)
         Bbg_evol                = np.concatenate([Bbg[1:] - Bbg[:-1],
@@ -451,6 +469,12 @@ class OIMAS_N(object):
         # update the total mass
         self.mass               = self.om_mass + self.min_mass
 
+        # udpate age horizon dictionary
+        self.age[self.t] = self.surface
+
+        # record new age horizon using cumulative mineral mass (conservative)
+        self.age_horizons.append({'t': self.t, 'cum_min_mass': np.sum(self.min_mass)})
+
     def get_dbd(self):
         """
         method tho retrieve dry bulk density
@@ -466,6 +490,25 @@ class OIMAS_N(object):
         """
 
         return self.Cre + self.Cla
+
+    def get_age_horizons(self):
+        """
+        Recover current elevation of each age horizon from cumulative mineral mass.
+        Mineral mass is fully conservative (no decay), making it a stable horizon marker.
+
+        :return: list of dicts with 't' (days) and 'z' (current elevation, m TAW)
+        """
+        cum_min_mass = np.cumsum(self.min_mass)
+        result = []
+        for h in self.age_horizons:
+            if h['cum_min_mass'] == 0.0:
+                z = self.surface
+            else:
+                idx = np.searchsorted(cum_min_mass, h['cum_min_mass'])
+                idx = min(idx, len(self.z) - 1)
+                z = self.z[idx]
+            result.append({'t': h['t'], 'z': z})
+        return result
 
     def get_units(self):
         """
