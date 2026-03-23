@@ -469,9 +469,6 @@ class OIMAS_N(object):
         # update the total mass
         self.mass               = self.om_mass + self.min_mass
 
-        # udpate age horizon dictionary
-        self.age[self.t] = self.surface
-
         # record new age horizon using cumulative mineral mass (conservative)
         self.age_horizons.append({'t': self.t, 'cum_min_mass': np.sum(self.min_mass)})
 
@@ -492,21 +489,11 @@ class OIMAS_N(object):
         return self.Cre + self.Cla
 
     def get_age_horizons(self):
-        """
-        Recover current elevation of each age horizon from cumulative mineral mass.
-        Mineral mass is fully conservative (no decay), making it a stable horizon marker.
-
-        :return: list of dicts with 't' (days) and 'z' (current elevation, m TAW)
-        """
-        cum_min_mass = np.cumsum(self.min_mass)
+        cum_min_mass = np.cumsum(self.min_mass[::-1])  # accumulate bottom-up
         result = []
         for h in self.age_horizons:
-            if h['cum_min_mass'] == 0.0:
-                z = self.surface
-            else:
-                idx = np.searchsorted(cum_min_mass, h['cum_min_mass'])
-                idx = min(idx, len(self.z) - 1)
-                z = self.z[idx]
+            idx = min(np.searchsorted(cum_min_mass, h['cum_min_mass']), len(self.z) - 1)
+            z = self.z[::-1][idx]  # index into flipped z array
             result.append({'t': h['t'], 'z': z})
         return result
 
