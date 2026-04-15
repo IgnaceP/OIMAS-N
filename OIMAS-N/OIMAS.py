@@ -4,15 +4,12 @@ import copy
 
 class OIMAS_N(object):
     def __init__(self, n_layers = 10, max_layer_thickness = .5,
-                 dt = 30, t = 0,
+                 dt = 1, t = 0,
                  rho_water = 1000, grav = 9.81,
                  rho_min = 2600, rho_om = 1300,
                  E0_min = 0.4, CI_min = 0.2, sigma_ref_min = 'top',
                  E0_om = 0.25, CI_om = 1.0, sigma_ref_om = 'top',
-                 Bmax = 2.5, Dmax = .55, Dmin = 0., D = .55,
-                 theta_Bmin = 0, day_peak = 244, phase = 56,
-                 ups_Gmax = 0.0138, nu_Gmin = 0,
-                 theta_bg = -6.8, Dmbm = 4.8, root_to_shoot = None,
+                 Bmax = 2.5, root_to_shoot = 1, turnover = 0.5,
                  gamma = .11, kappa = .11, lamda = .11,
                  Kla0 = .17, Kre0 = .001, mu_la = 1e6, mu_re = 1e6,
                  chi_la = .32, chi_re = .5,
@@ -31,11 +28,13 @@ class OIMAS_N(object):
         Mudd, S.M., Howell, S.M., Morris, J.T., 2009. Impact of dynamic feedbacks between sedimentation, sea-level rise, and biomass production on near-surface marsh stratigraphy and carbon accumulation. Estuar., Coast. Shelf Sci. 82, 377–389. https://doi.org/10.1016/j.ecss.2009.01.028
         Kirwan, M.L., Mudd, S.M., 2012. Response of salt-marsh carbon accumulation to climate change. Nature 489, 550–553. https://doi.org/10.1038/nature11440
         Bruns, N.E., Noyce, G.L., Kirwan, M.L., 2025. The role of geomorphology in mediating biomass allocation impacts on salt-marsh resilience and carbon accumulation. Estuar., Coast. Shelf Sci. 327, 109549. https://doi.org/10.1016/j.ecss.2025.109549
+        Rietl, A. J., Megonigal, J. P., Herbert, E. R. & Kirwan, M. L. Vegetation Type and Decomposition Priming Mediate Brackish Marsh Carbon Accumulation Under Interacting Facets of Global Change. Geophys. Res. Lett. 48, (2021).
+        Vahsen, M. L. et al. Cohort Marsh Equilibrium Model (CMEM): History, Mathematics, and Implementation. J. Geophys. Res.: Biogeosciences 129, (2024).
 
         :param  n_layers (int): number of soil layers
         :param max_layer_thickness (float): maximum thickness of a layer (m)
-        :param  dt (float): model timestep (days)
-        :param  t (float): current time (days)
+        :param  dt (integer): model timestep (years)
+        :param  t (integer): current time (years)
         :param  rho_water (float): density of water (kg/m³)
         :param  grav (float): gravitational acceleration (m/s²)
         :param  rho_min (float): density of solid mineral fraction (no voids) (kg m^-3)
@@ -47,21 +46,13 @@ class OIMAS_N(object):
         :param  CI_om (float): compression index of organic matter fraction
         :param  sigma_ref_om (float): reference stress for organic matter (kg s^-2 m^-1)
         :param  Bmax (float): maximum above-ground biomass at optimal elevation (kg/m²)
-        :param  Dmax (float): maximum marsh platform depth relative to MHHW (m)
-        :param  Dmin (float): minimum marsh platform depth relative to MHHW (m)
-        :param  D (float): current marsh platform depth relative to MHHW (m)
-        :param  theta_Bmin (float): fraction of minimum above-ground biomass relative to peak biomass
-        :param  day_peak (int): day of year for peak above-ground biomass
-        :param  phase (float): phase shift between biomass accumulation and growth curves (days)
-        :param  ups_Gmax (float): maximum above-ground growth rate coefficient (kg m^-2 day^-1 per biomass unit)
-        :param  nu_Gmin (float): minimum above-ground growth rate coefficient (kg m^-2 day^-1 per biomass unit)
-        :param  theta_bg (float): linear coefficient for root:shoot ratio with depth
-        :param  Dmbm (float): vertical distribution constant for below-ground biomass
+        :param  root_to_shoot (float): ratio of root biomass to shoot biomass
+        :param  turnover (float): turnover rate of above-ground biomass (year^-1)
         :param  gamma (float): scale depth for below-ground biomass decay (m)
         :param  kappa (float): scale depth for below-ground mortality decay profile (m)
-        :param  lamda (float): scale depth for below-ground growth decay profile (m)
-        :param  Kla0 (float): surface decay constant for labile carbon pool (timestep^-1; likely to be a month)
-        :param  Kre0 (float): surface decay constant for recalcitrant carbon pool (timestep^-1; likely to be a month)
+        :param  lambda (float): scale depth for below-ground mortality decay profile (m)
+        :param  Kla0 (float): surface decay constant for labile carbon pool (year^-1)
+        :param  Kre0 (float): surface decay constant for recalcitrant carbon pool (year^-1)
         :param  mu_la (float): attenuation length-scale for labile decay (m)
         :param  mu_re (float): attenuation length-scale for recalcitrant decay (m)
         :param  chi_la (float): fraction of root mortality routed to labile carbon pool
@@ -74,10 +65,12 @@ class OIMAS_N(object):
 
         self.n_layers       = n_layers              # number of layers
         self.max_layer      = max_layer_thickness   # maximum layer tickness (m)
-        self.dt             = dt                    # time step (days)
+        self.dt             = dt                    # time step (years)
         self.rho_water      = rho_water             # bulk density of water (kg m^-3)
         self.grav           = grav                  # gravitational acceleration (m s^-2)
-        self.t              = t                     # timestep (days)
+        self.t              = t                     # timestep (years)
+        if not isinstance(self.dt, int) or not isinstance(self.t, int):
+            raise ValueError("dt and t must be integers")
 
         # === bulk densities === #
 
@@ -95,26 +88,17 @@ class OIMAS_N(object):
         self.sigma_ref_om   = sigma_ref_om          # reference stress (kg s^-2 m^-1) for the organic matter fraction
 
         # === biomass evolution === #
-        self.Bmax           = Bmax                  # maximum above-ground biomass at optimal elevation (kg m^-2)
-        self.D              = D                     # marsh platform depth relative to MHHW (m)
-        self.Dmin           = Dmin                  # elevation lower bound (m)
-        self.Dmax           = Dmax                  # elevation upper bound (m)
-        self.theta_Bmin     = theta_Bmin            # proportional minimum above-ground biomass at low elevation (fraction of Bp)
-        self.day_peak       = day_peak              # peak biomass day (DOY, typically mid-August)
-        self.ups_Gmax       = ups_Gmax              # max above-ground growth rate coefficient (kg m^-2 day^-1 per biomass unit)
-        self.nu_Gmin        = nu_Gmin               # min above-ground growth coefficient (can be 0)
-        self.phase          = phase                 # phase shift between biomass accumulation and growth curves (days)
-        self.theta_bg       = theta_bg              # linear coefficient of the relation between the roots:shoots ratio and the depth below MHHW
-        self.Dmbm           = Dmbm                  # intercept of root-shoot ratio equation
-        self.root_to_shoot  = root_to_shoot         # root:shoot ratio, as alternative for theta_bg and Dmbm
+        self.Bmax           = Bmax                  # maximum above-ground biomass (kg m^-2)
+        self.root_to_shoot  = root_to_shoot         # root:shoot ratio
+        self.turnover       = turnover              # turnover rate (year^-1)
         self.gamma          = gamma                 # scale depth for below-ground biomass decay (m)
         self.kappa          = kappa                 # scale depth for mortality decay profile (m)
-        self.lamda          = lamda                 # scale depth for growth decay profile (m)
+        self.lamda          = lamda                # scale depth for belowground decay profile (m)
 
         # === organic carbon decay === #
 
-        self.Kla0           = Kla0                  # surface decay constant for labile pool (day^-1)
-        self.Kre0           = Kre0                  # surface decay constant for recalcitrant pool (day^-1)
+        self.Kla0           = Kla0                  # surface decay constant for labile pool (year^-1)
+        self.Kre0           = Kre0                  # surface decay constant for recalcitrant pool (year^-1)
         self.mu_la          = mu_la                 # attenuation length-scale for labile decay (m)
         self.mu_re          = mu_re                 # attenuation length-scale for recalcitrant decay (m)
         self.chi_la         = chi_la                # fraction of mortality routed to labile-fast carbon pool
@@ -165,7 +149,7 @@ class OIMAS_N(object):
 
         # calculate biomass
         self.biomass()
-        self.mass           += self.bbg[:,-1]
+        self.mass           += self.bbg
 
         # set base level
         self.baselevel      = -1 * np.sum(self.thickness)
@@ -240,7 +224,7 @@ class OIMAS_N(object):
             self.E              = E_min * (1 - Pom) + E_om * Pom
 
             # update the dry bulk density
-            rho_bulk            = (self.rho_om * ((self.om_mass + self.bbg[:,-1]) / self.mass) + self.rho_min * (self.min_mass / self.mass)) / (1 + self.E)
+            rho_bulk            = (self.rho_om * ((self.om_mass + self.bbg) / self.mass) + self.rho_min * (self.min_mass / self.mass)) / (1 + self.E)
 
             # calculation of tickness
             self.thickness      = self.mass / rho_bulk
@@ -278,8 +262,7 @@ class OIMAS_N(object):
             self.Cla            = np.concatenate([np.array([self.Cla[0]/2, self.Cla[0]/2]), self.Cla[1:]])
             self.Cre            = np.concatenate([np.array([self.Cre[0]/2, self.Cre[0]/2]), self.Cre[1:]])
             self.thickness      = np.concatenate([np.array([self.thickness[0]/2, self.thickness[0]/2]), self.thickness[1:]])
-            top_layer = self.bbg[0:1, :] / 2  # shape (1, n_days)
-            self.bbg = np.vstack([top_layer, top_layer, self.bbg[1:, :]])
+            self.bbg            = np.concatenate([np.array([self.bbg[0] / 2]), np.array([self.bbg[0] / 2]), self.bbg[1:]])
 
             self.mass           = self.min_mass + self.om_mass
             self.n_layers       = len(self.thickness)
@@ -290,104 +273,51 @@ class OIMAS_N(object):
         calculate the biomass evolution
 
         !!! timestep of the biomass calculation is daily !!!
-        !!! at the end the mortality rate is integrated over the model timestep (likely monthly but can be changed) !!!
+        !!! at the end the mortality rate is integrated over the model timestep !!!
 
         """
 
-        # time step to day of the year
-        days                    = np.arange(self.t - self.dt, self.t)
-        days[days < 1]          = 365 + days[days < 1]
-        days[days > 365]        = (days%365)[days > 365]
+
+
 
         # ========================== #
         # Above-ground vegetation
         # ========================== #
 
         # peak above-ground biomass (kg m^-2)
-        Bp                      = self.Bmax * (self.D - self.Dmin) / (self.Dmax - self.Dmin)
-        Bmin                    = self.theta_Bmin * Bp
-
-        # above-ground biomass over time (kg m^-2)
-        Bag                     = .5 * (Bmin + Bp + (Bp - Bmin) *
-                                    np.cos(2 * np.pi * (days - self.day_peak) / 365))
-        Bag_extra_day           = .5 * (Bmin + Bp + (Bp - Bmin) *
-                                    np.cos(2 * np.pi * (self.t - self.day_peak) / 365))
-
-        # maximum growth grate (kg m^-2 day^-1)
-        Gmax                    = self.ups_Gmax * Bp
-        # minimum growth rate (kg m^-2 day^-1)
-        Gmin                    = self.nu_Gmin * Bp
-        # above-ground growth rate (kg m^-2 day^-1)
-        Gag                     = .5 * (Gmin + Gmax + (Gmax - Gmin) *
-                                    np.cos(2 * np.pi * (days - self.day_peak + self.phase) / 365))
-
-        # above-ground biomass over time (kg m^-2 day^-1)
-        Bag_evol                = np.concatenate(
-                                    [Bag[1:] - Bag[:-1], [Bag_extra_day - Bag[-1]]])
-        # above-ground mortality rate (kg m^-2 day^-1)
-        Mag                     = Bag_evol - Gag
-
-        # set class attributes
-        self.Bag                = Bag
-        self.Gag                = Gag
-        self.Mag                = Mag
+        Bag                      = self.Bmax
 
         # ========================== #
         # Below-ground vegetation
         # ========================== #
 
         # root-to-shoot ratio
-        if self.root_to_shoot is None:
-            root_to_shoot           = self.theta_bg * self.D + self.Dmbm
-            Bbg                     = Bag * root_to_shoot
-        else:
-            root_to_shoot           = self.root_to_shoot(days)
-            Bbg                     = Bp * root_to_shoot
+        Bbg                     = Bag * self.root_to_shoot
 
-        # total below-ground biomass (kg m^-2)
-
-        Bbg_extra_day           = Bag_extra_day * (self.theta_bg * self.D + self.Dmbm)
-        # below-ground biomass over time (kg m^-2 day^-1)
-        Bbg_evol                = np.concatenate([Bbg[1:] - Bbg[:-1],
-                                   [Bbg_extra_day - Bbg[-1]]])
         # below-ground biomass per unit volume at the surface of the marsh (kg m^-3)
         b0                      = Bbg / self.gamma
-        # below-ground mortality rate (kg m^-2 day^-1)
-        Mbg                     = Mag * (self.theta_bg * self.D + self.Dmbm)
-        # below-ground biomass mortality at the surface of the marsh (kg m^-3 day^-1)
+        bbg                     = b0 * np.exp(-1 * self.d / self.lamda)
+
+        # !!! not following Mudd et al. 2009
+        # !!! mortality rate of below-ground biomass will be estimated based on the seasonal decrease in below-ground biomass
+
+        # below-ground mortality rate (kg m^-2 timestep^-1)
+        Mbg                     = Bbg * self.turnover
         m0                      = Mbg / self.kappa
 
-        # reshape depth array
-        depth                   = self.d[:, None]
-
-        # below-ground biomass  per depth interval (kg m^-3)
-        bbg                     = b0[None, :] * np.exp(-1 * depth / self.gamma)
-
         # below-ground biomass mortality per depth interval (kg m^-3 day^-1)
-        mbg                     = m0[None, :] * np.exp(-1 * depth / self.kappa)
-
-        # integrate over time (days → timestep; kg m^-3 timestep^-1)
-        mbg_time_int            = np.sum(mbg, axis=1)
+        mbg                     = m0 * np.exp(-1 * self.d / self.kappa)
 
         # convert from per volume to per layer (kg m^-2 timestep^-1)
-        bbg_layer               = bbg * self.thickness[:, None]
-        mbg_layer               = mbg_time_int * self.thickness
-
-        # -----------------------------
-        # Ensure sum of bbg_layer matches Bbg exactly
-        total_bbg_layer         = np.sum(bbg_layer, axis=0)
-        missing                 = Bbg - total_bbg_layer
-        #bbg_layer[0, :]         += missing
-        total_mbg_layer         = np.sum(mbg_layer)
-        missing_mbg             = np.sum(Mbg) - total_mbg_layer
-        #mbg_layer[0]            += missing_mbg
-        # -----------------------------
+        mbg_layer               = mbg * self.thickness
 
         # set class attributes
+        self.Abg                = Bag
         self.Bbg                = Bbg
+        self.bbg                = bbg
         self.Mbg                = Mbg
         self.Mbg_int            = mbg_layer
-        self.bbg                = bbg_layer
+
 
     def organic_carbon_decay(self):
         """
@@ -401,14 +331,12 @@ class OIMAS_N(object):
         Kre                     = self.Kre0 * np.exp(-self.d / self.mu_re)
 
         # evolution of labile carbon pool (kg m^-2)
-        Cla_evol                = (-Kla * self.Cla * self.dt
-                                    + -1 * self.Mbg_int * self.chi_la * self.f_C)
+        Cla_evol                = -Kla * self.Cla * self.dt + self.Mbg_int * self.chi_la * self.f_C
         self.Cla                += Cla_evol
         self.Cla                = np.maximum(self.Cla, 0)
 
         # evolution of recalcitrant carbon pool (kg m^-2)
-        Cre_evol                = (-Kre * self.Cre * self.dt
-                                    + -1 * self.Mbg_int * self.chi_re * self.f_C)
+        Cre_evol                = -Kre * self.Cre * self.dt + -1 * self.Mbg_int * self.chi_re * self.f_C
         self.Cre                += Cre_evol
         self.Cre                = np.maximum(self.Cre, 0)
 
@@ -443,7 +371,7 @@ class OIMAS_N(object):
 
         # update timestep
         self.t                  += self.dt
-        #print(f'ready with time step: {self.t} days')
+        #print(f'ready with time step: {self.t} years')
 
     def sedimentation(self, sedimentation_om, sedimentation_min, f_Cla = None):
         """
@@ -496,87 +424,6 @@ class OIMAS_N(object):
             z = self.z[::-1][idx]  # index into flipped z array
             result.append({'t': h['t'], 'z': z})
         return result
-
-    def get_units(self):
-        """
-        Return a dictionary containing the physical units of all model attributes.
-
-        Units follow SI conventions and the formulations used in Mudd (2009),
-        Kirwan & Mudd (2012), and Bruns et al. (2025).
-        """
-
-        units = {
-
-            # === general parameters ===
-            "n_layers": "–",
-            "dt": "days",
-            "t": "days",
-            "rho_water": "kg m^-3",
-            "grav": "m s^-2",
-
-            # === material densities ===
-            "rho_min": "kg m^-3",
-            "rho_om": "kg m^-3",
-
-            # === compaction parameters ===
-            "E0_min": "–",
-            "CI_min": "–",
-            "sigma_ref_min": "kg m^-1 s^-2",
-            "E0_om": "–",
-            "CI_om": "–",
-            "sigma_ref_om": "kg m^-1 s^-2",
-
-            # === layer state variables ===
-            "min_mass": "kg m^-2",
-            "om_mass": "kg m^-2",
-            "mass": "kg m^-2",
-            "thickness": "m",
-            "d": "m",
-            "buoy_weight": "Pa",
-
-            # === biomass parameters ===
-            "Bmax": "kg m^-2",
-            "D": "m",
-            "Dmin": "m",
-            "Dmax": "m",
-            "theta_Bmin": "–",
-            "day_peak": "day of year",
-            "phase": "days",
-            "ups_Gmax": "day^-1",
-            "nu_Gmin": "day^-1",
-            "theta_bg": "–",
-            "Dmbm": "–",
-            "gamma": "m",
-            "kappa": "m",
-            "lamda": "m",
-
-            # === biomass state variables ===
-            "Bag": "kg m^-2",
-            "Bbg": "kg m^-2",
-            "bbg": "kg m^-3",
-            "Gag": "kg m^-2 day^-1",
-            "Mag": "kg m^-2 day^-1",
-            "Mbg": "kg m^-3 day^-1",
-            "Mbg_int": "kg m^-2 timestep^-1",
-
-            # === carbon pools ===
-            "Cla": "kg C m^-2",
-            "Cre": "kg C m^-2",
-
-            # === carbon decay parameters ===
-            "Kla0": "day^-1",
-            "Kre0": "day^-1",
-            "mu_la": "m",
-            "mu_re": "m",
-            "chi_la": "–",
-            "chi_re": "–",
-            "f_C": "–",
-
-            # === carbon / OM fluxes ===
-            "om_evol": "kg OM m^-2 timestep^-1",
-        }
-
-        return units
 
     def copy(self):
         """
