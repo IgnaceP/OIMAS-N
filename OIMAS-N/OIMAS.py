@@ -1,6 +1,10 @@
 import numpy as np
 import scipy
+import os
 import copy
+from julia import Main as Julia
+
+Julia.include(f'{os.environ["MARSEDPATH"]}/MARSED.jl')
 
 class OIMAS_N(object):
     def __init__(self, n_layers = 10, max_layer_thickness = .5,
@@ -302,7 +306,7 @@ class OIMAS_N(object):
         # !!! mortality rate of below-ground biomass will be estimated based on the seasonal decrease in below-ground biomass
 
         # below-ground mortality rate (kg m^-2 timestep^-1)
-        Mbg                     = Bbg * self.turnover
+        Mbg                     = self.dt * Bbg * self.turnover
         m0                      = Mbg / self.kappa
 
         # below-ground biomass mortality per depth interval (kg m^-3 day^-1)
@@ -372,6 +376,40 @@ class OIMAS_N(object):
         # update timestep
         self.t                  += self.dt
         #print(f'ready with time step: {self.t} years')
+
+
+    def marsed(self, hwls, avg_tide_t, avg_tide_h, sed_om_frac = 0.049, ws = 1.1e-4, k = 0.606, dt = 300, f_Cla = None,  rho = None):
+        """
+        method to calculate sedimentation using the MARSED model
+        :param hwls (1D numpy array): high water levels
+        :param avg_tide_t (1D numpy array): timings of average high water level
+        :param avg_tide_h (1D numpy array): average high water level
+        :param sed_om_frac (float): fraction of organic matter that is sedimented
+        :param ws (float): sedimentation velocity
+        :param k (float): factor to determine the incoming sediment in function of the incoming high water level C0 = k * (HWL - E0)
+        :param rho (float): bulk density of deposited sediments (if None, the bulk density of the top layer is used)
+        :param dt (int): timestep (minutes) of the MARSED model within one tidal cycle
+        :param f_Cla (float): portion of sediment carbon pool that is labile
+        :return:
+        """
+        if rho == None:
+            rho = (self.mass / self.thickness)[0]
+
+        # make sure the arrays are in the right format to match the Julia types
+        hwls = np.asarray(hwls, dtype = np.float64)
+        avg_tide_t = np.asarray(avg_tide_t, dtype = np.float64)
+        avg_tide_h = np.asarray(avg_tide_h, dtype = np.float64)
+
+        # call the MARSED model (written in Julia for computational efficiency)
+        upd_surface = Julia.marsed(hwls, avg_tide_t, avg_tide_h, E0=self.surface, ws = ws, k = k, dt = dt, rho = rho)
+        # get the sedimentation in mass (not m)
+        sed = (upd_surface - self.surface) * rho
+
+        # split sediment into organic and mineral
+        sed_om = sed_om_frac * sed
+        sed_min = (1 - sed_om_frac) * sed
+
+        self.sedimentation(sed_om, sed_min, f_Cla = f_Cla)
 
     def sedimentation(self, sedimentation_om, sedimentation_min, f_Cla = None):
         """
