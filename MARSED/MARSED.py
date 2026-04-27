@@ -1,5 +1,4 @@
 import numpy as np
-from tqdm import tqdm
 
 def marsed(HWLs, avg_tide_t, avg_tide_h, E0 = 4.5, k = 0.606, rho = 560, ws = 1.1e-4, dt = 300):
     """
@@ -26,7 +25,7 @@ def marsed(HWLs, avg_tide_t, avg_tide_h, E0 = 4.5, k = 0.606, rho = 560, ws = 1.
     sed  = np.zeros(tides_n + 1)
 
     # loop over tides
-    for tide in tqdm(range(1, tides_n + 1)):
+    for tide in range(1, tides_n + 1):
         hwl = HWLs[tide - 1]
 
         if hwl > E[tide - 1]:
