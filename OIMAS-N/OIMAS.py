@@ -1,9 +1,10 @@
 import numpy as np
-import scipy
 import os
 import copy
-from julia import Main as Julia
+import sys
 
+
+from julia import Main as Julia
 Julia.include(f'{os.environ["MARSEDPATH"]}/MARSED.jl')
 
 class OIMAS_N(object):
@@ -11,6 +12,8 @@ class OIMAS_N(object):
                  dt = 1, t = 0,
                  rho_water = 1000, grav = 9.81,
                  rho_min = 2600, rho_om = 1300,
+                 compaction_method = 'Gutierrez',
+                 emp_dbd_function = None,
                  E0_min = 0.4, CI_min = 0.2, sigma_ref_min = 'top',
                  E0_om = 0.25, CI_om = 1.0, sigma_ref_om = 'top',
                  Bmax = 2.5, root_to_shoot = 1, turnover = 0.5,
@@ -83,6 +86,9 @@ class OIMAS_N(object):
 
         # === compaction === #
 
+        self.compaction_method = compaction_method  # compaction method (options: "Gutierrez" or "emperical_om_depth")
+        self.emp_dbd_function = emp_dbd_function    # emperical method to predict dry bulk density
+
         self.E0_min         = E0_min                # void ratio (dimensionless) at reference stress for the mineral fraction
         self.CI_min         = CI_min                # compression index for the mineral fraction
         self.sigma_ref_min  = sigma_ref_min         # reference stress (kg s^-2 m^-1) for the mineral fraction
@@ -109,7 +115,7 @@ class OIMAS_N(object):
         self.chi_re         = chi_re                # fraction of mortality routed to labile-slow carbon pool
         self.f_C            = f_C                   # carbon fraction of dry biomass (dimensionless)
 
-    def initialize_layers(self, init_min_mass, init_om_mass, f_Cla = None, initial_surface = 0.0):
+    def initialize_layers(self, init_min_mass, init_om_mass, f_Cla = None, initial_surface = 0.0, set_bbg = False, bbg = None):
         """
         Initialize the layers with mineral and organic masses.
 
@@ -153,10 +159,13 @@ class OIMAS_N(object):
 
         # calculate biomass
         self.biomass()
-        self.mass           += self.bbg
+        if set_bbg:
+            self.bbg = bbg
+            self.bbg_per_layer = self.bbg * self.thickness
+        self.mass           += self.bbg_per_layer
 
         # set base level
-        self.baselevel      = -1 * np.sum(self.thickness)
+        self.baselevel      = initial_surface - np.sum(self.thickness)
 
         # calculate stress without compaction
         self.calculate_buoyant_weight()
@@ -193,19 +202,24 @@ class OIMAS_N(object):
         # dry bulk density
         rho_dry = self.mass / self.thickness
 
-        # mixture solid density
-        rho_s = (
-                self.rho_om * (self.om_mass / self.mass) +
-                self.rho_min * (self.min_mass / self.mass)
-        )
+        # mass fractions
+        f_om = self.om_mass / self.mass
+        f_min = self.min_mass / self.mass
+
+        # mixture solid density (physically consistent harmonic mean)
+        rho_s = 1.0 / ((f_om / self.rho_om) + (f_min / self.rho_min))
 
         # effective unit weight (physically consistent)
         gamma_eff = rho_dry * (rho_s - self.rho_water) / rho_s * self.grav
 
         gamma_eff[gamma_eff < 0] = 0  # numerical safety
 
-        # cumulative effective stress
-        self.buoy_weight = np.cumsum(gamma_eff * self.thickness)
+        # Calculate incremental stress contribution per layer
+        stress_increment = gamma_eff * self.thickness
+
+        # Calculate stress at the CENTER (midpoint) of each layer
+        # This matches where material properties (like rho_dry) are usually measured
+        self.buoy_weight = np.cumsum(stress_increment) - (stress_increment / 2.0)
 
     def compaction(self, iterations = 5):
         """
@@ -213,42 +227,64 @@ class OIMAS_N(object):
 
         :param  iterations (int): number of iterations (the buoyant weight is updated each iteration)
         """
+        if self.compaction_method == 'Gutierrez':
+            for _ in range(iterations):
 
-        for _ in range(iterations):
+                # void ratio in function of compaction
+                self.sigma          = np.maximum(self.buoy_weight, 1e-6)
+                E_min               = self.E0_min - self.CI_min * np.log(self.sigma/self.sigma_ref_min)
+                E_om                = self.E0_om - self.CI_om * np.log(self.sigma/self.sigma_ref_om)
+                E_min               = np.maximum(0, np.minimum(E_min, self.E0_min))
+                E_om                = np.maximum(0, np.minimum(E_om, self.E0_om))
 
-            # void ratio in function of compaction
-            self.sigma          = np.maximum(self.buoy_weight, 1e-6)
-            E_min               = self.E0_min - self.CI_min * np.log(self.sigma/self.sigma_ref_min)
-            E_om                = self.E0_om - self.CI_om * np.log(self.sigma/self.sigma_ref_om)
-            E_min               = np.maximum(0, np.minimum(E_min, self.E0_min))
-            E_om                = np.maximum(0, np.minimum(E_om, self.E0_om))
+                # calculate lump void ratio (!!! E_min and E_om are calculated from one single DBD, otherwise this is not preferred !!!)
+                Pom                 = (self.om_mass) / (self.om_mass + self.min_mass)
+                Pmin                = 1 - Pom
 
-            # calculate lump void ratio (!!! E_min and E_om are calculated from one single DBD, otherwise this is not preferred !!!)
-            Pom                 = self.om_mass / self.mass
-            self.E              = E_min * (1 - Pom) + E_om * Pom
+                self.Pom            = Pom
+                self.E_min          = E_min
+                self.E_om           = E_om
 
-            # update the dry bulk density
-            rho_bulk            = (self.rho_om * ((self.om_mass + self.bbg) / self.mass) + self.rho_min * (self.min_mass / self.mass)) / (1 + self.E)
+                self.E              = E_min*(E_om/E_min)**(Pom)
+                self.E              = np.clip(self.E, 0, 15)
+                #self.E             = E_min * (1 - Pom) + E_om * Pom
 
-            # calculation of tickness
-            self.thickness      = self.mass / rho_bulk
+                # update the dry bulk density
+                rho_solid           = (Pom / self.rho_om + Pmin / self.rho_min) ** -1
+                rho_bulk            = rho_solid / (1 + self.E)
 
-            # split layers if they get too thick
-            self.split_top_layer()
+        elif self.compaction_method == 'emperical_om_depth':
+            if self.emp_dbd_function is None:
+                    raise ValueError('emp_dbd_function is not defined')
+            rho_bulk = self.emp_dbd_function(self.om_mass/self.mass)
 
-            # update vertical coordinate, surface level and depths
-            self.update_geometry()
+        else:
+            raise ValueError('compaction method not defined')
 
-            # update buoyant weight
-            self.calculate_buoyant_weight()
+        # calculation of tickness
+        self.thickness      = self.mass / rho_bulk
 
-    def update_geometry(self):
+        # split layers if they get too thick
+        self.split_top_layer()
+
+        # update vertical coordinate, surface level and depths
+        self.update_geometry()
+
+        # update buoyant weight
+        self.calculate_buoyant_weight()
+
+    def update_geometry(self, surface = None):
         """
         Update surface elevation, layer centers, and z-coordinates.
         """
         self.surface            = np.sum(self.thickness) + self.baselevel
         self.d                  = np.cumsum(self.thickness) - self.thickness / 2
         self.z                  = self.surface - self.d
+
+        if surface is not None:
+            self.surface = surface
+            self.z = self.surface - self.d
+            self.baselevel = self.surface - np.sum(self.thickness)
 
     def split_top_layer(self):
         """
@@ -281,9 +317,6 @@ class OIMAS_N(object):
 
         """
 
-
-
-
         # ========================== #
         # Above-ground vegetation
         # ========================== #
@@ -301,6 +334,7 @@ class OIMAS_N(object):
         # below-ground biomass per unit volume at the surface of the marsh (kg m^-3)
         b0                      = Bbg / self.gamma
         bbg                     = b0 * np.exp(-1 * self.d / self.lamda)
+        bbg_per_layer           = bbg * self.thickness
 
         # !!! not following Mudd et al. 2009
         # !!! mortality rate of below-ground biomass will be estimated based on the seasonal decrease in below-ground biomass
@@ -316,9 +350,10 @@ class OIMAS_N(object):
         mbg_layer               = mbg * self.thickness
 
         # set class attributes
-        self.Abg                = Bag
+        self.Agb                = Bag
         self.Bbg                = Bbg
         self.bbg                = bbg
+        self.bbg_per_layer      = bbg_per_layer
         self.Mbg                = Mbg
         self.Mbg_int            = mbg_layer
 
@@ -337,10 +372,11 @@ class OIMAS_N(object):
         # evolution of labile carbon pool (kg m^-2)
         Cla_evol                = -Kla * self.Cla * self.dt + self.Mbg_int * self.chi_la * self.f_C
         self.Cla                += Cla_evol
+        self.Cla                += Cla_evol
         self.Cla                = np.maximum(self.Cla, 0)
 
         # evolution of recalcitrant carbon pool (kg m^-2)
-        Cre_evol                = -Kre * self.Cre * self.dt + -1 * self.Mbg_int * self.chi_re * self.f_C
+        Cre_evol                = -Kre * self.Cre * self.dt + self.Mbg_int * self.chi_re * self.f_C
         self.Cre                += Cre_evol
         self.Cre                = np.maximum(self.Cre, 0)
 
@@ -360,7 +396,7 @@ class OIMAS_N(object):
         self.om_mass            = np.maximum(self.om_mass, 0)
 
         # update the total mass
-        self.mass               = self.om_mass + self.min_mass
+        self.mass               = self.om_mass + self.min_mass + self.bbg_per_layer
 
         # Recalculate layer properties
         # Call compaction to update:
@@ -378,7 +414,7 @@ class OIMAS_N(object):
         #print(f'ready with time step: {self.t} years')
 
 
-    def marsed(self, hwls, avg_tide_t, avg_tide_h, sed_om_frac = 0.049, ws = 1.1e-4, k = 0.606, dt = 300, f_Cla = None,  rho = None):
+    def marsed(self, hwls, avg_tide_t, avg_tide_h, sed_om_frac = 0.049, ws = 1.1e-4, k = 0.606, dt = 300, f_Cla = None,  rho = None, use_Julia = False, print_output = False):
         """
         method to calculate sedimentation using the MARSED model
         :param hwls (1D numpy array): high water levels
@@ -396,18 +432,34 @@ class OIMAS_N(object):
             rho = (self.mass / self.thickness)[0]
 
         # make sure the arrays are in the right format to match the Julia types
-        hwls = np.asarray(hwls, dtype = np.float64)
-        avg_tide_t = np.asarray(avg_tide_t, dtype = np.float64)
-        avg_tide_h = np.asarray(avg_tide_h, dtype = np.float64)
+        hwls = np.asarray(hwls, dtype = np.float32)
+        avg_tide_t = np.asarray(avg_tide_t, dtype = np.float32)
+        avg_tide_h = np.asarray(avg_tide_h, dtype = np.float32)
 
-        # call the MARSED model (written in Julia for computational efficiency)
-        upd_surface = Julia.marsed(hwls, avg_tide_t, avg_tide_h, E0=self.surface, ws = ws, k = k, dt = dt, rho = rho)
+        tide_times = np.asarray(np.arange(0, 21600, dt) - 21600 / 2, dtype = np.float32)
+        ht = np.zeros_like(tide_times)
+        C = np.zeros_like(tide_times)
+
+        if use_Julia:
+            # call the MARSED model (written in Julia for computational efficiency)
+            upd_surface = Julia.marsed(hwls, avg_tide_t, avg_tide_h, tide_times, ht, C, E0=self.surface, ws = ws, k = k, dt = dt, rho = rho)
+
+        else:
+            upd_surface = marsed(hwls, avg_tide_t, avg_tide_h, E0=self.surface, ws = ws, k = k, dt = dt, rho = rho)
+
+
         # get the sedimentation in mass (not m)
         sed = (upd_surface - self.surface) * rho
 
         # split sediment into organic and mineral
         sed_om = sed_om_frac * sed
         sed_min = (1 - sed_om_frac) * sed
+
+        if print_output:
+            print('MARSED sedimentation:')
+            print('\t mineral sedimentation (kg m^-2):', sed_min)
+            print('\t organic sedimentation (kg m^-2):', sed_om)
+            print('------------------------------------------------')
 
         self.sedimentation(sed_om, sed_min, f_Cla = f_Cla)
 
@@ -426,7 +478,8 @@ class OIMAS_N(object):
 
         # if ratio labile to recalcitrant fraction is undefined, estimate based on chi_la and chi_re
         if f_Cla == None:
-            f_Cla               = self.chi_la / (self.chi_re + self.chi_la)
+            f_Cla               = self.chi_la
+
 
         C                       = sedimentation_om * self.f_C
         self.Cla[0]             += C * f_Cla
@@ -470,7 +523,5 @@ class OIMAS_N(object):
         This allows safe branching of simulations without shared state.
         """
         return copy.deepcopy(self)
-
-
 
 

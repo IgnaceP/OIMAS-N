@@ -5,33 +5,20 @@ import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib
 from mpl_toolkits.axes_grid1.inset_locator import inset_axes
+from joblib import Parallel, delayed
+from tqdm import tqdm
+import gc
 
 import scipy
 import pandas as pd
 from datetime import datetime
 
-from tqdm import tqdm
 from callibrate_K_bash_functions import *
-import gc
-
-matplotlib.style.use("ip02")
-
-BASE_MODEL_DIR = "/Users/ignace/Documents/WETCOAST/model/OIMAS-N"
-os.chdir(BASE_MODEL_DIR)
-sys.path.append(BASE_MODEL_DIR)
 
 from OIMAS import OIMAS_N
-from read_C_obs_data import read_observation_data
+from load_data import *
 
-from functions import (
-    load_soil_carbon,
-    load_bgb_data,
-    load_elevation_data,
-    plot_carbon_profiles,
-    plot_dbd_profiles,
-    compute_initial_masses,
-)
-
+matplotlib.style.use("ip02")
 matplotlib.use('agg')
 
 def parse_args():
@@ -51,9 +38,25 @@ def parse_args():
         help="number of latin hypercub samples",
         default=100000
     )
+
+    parser.add_argument(
+        "--nodes",
+        type=int,
+        required=False,
+        help="number of latin hypercub samples",
+        default=4
+    )
+
+    parser.add_argument(
+        "--chunk_size",
+        type=int,
+        required=False,
+        help="number of latin hypercub samples",
+        default=500
+    )
     return parser.parse_args()
 
-def main(auger_ID, lhs_n = 100000):
+def main(auger_ID, lhs_n = 100000, nodes = 4, chunk_size = 500):
     #%% loop over all auger IDs in a zone
 
     zone        = int(auger_ID[1:3])
@@ -88,17 +91,14 @@ def main(auger_ID, lhs_n = 100000):
     #%% Load data
     # -----------------------------------------------------------------------------
 
-    soil        = load_soil_carbon([0, zone], read_observation_data)
+    soil        = load_soil_carbon([0, zone])
     bgb         = load_bgb_data()
-    elev        = load_elevation_data([zone])
-    rtk         = pd.read_csv('/Users/ignace/Documents/WETCOAST/Data/Saefthinge/RTK/sample_locations_RTK.csv', index_col=1)[["z_TAW"]]
-    sar         = pd.read_csv('/Users/ignace/Documents/WETCOAST/Data/Saefthinge/LiDAR/surface_elevation_accumulation.csv', index_col=0)
+    rtk         = load_rtk_data()
+    sar         = load_sar_data()
     rtk         = rtk.join(sar['SAR'], how = 'inner')
+    avg_tide    = load_avg_tide()
+    hwl_df      = load_hwls()
 
-    avg_tide = pd.read_csv('/Users/ignace/Documents/WETCOAST/Data/Saefthinge/Getij/Kloosterzande_avg_H.csv',
-                           index_col=0)
-    hwl_df = pd.read_csv('/Users/ignace/Documents/WETCOAST/Data/Saefthinge/Getij/Kloosterzande_HWLs_1986-2025.csv',
-                         skiprows=1, index_col=0, parse_dates=True)
 
     # -----------------------------------------------------------------------------
     #%% Plot observations
@@ -160,7 +160,7 @@ def main(auger_ID, lhs_n = 100000):
     # prepare a Latin Hypercube for sensitivity analysis for K labile
     param_bounds    = {'Kla0': (0, 0.25),
                        'Kre0': (0, 0.1),
-                       'k': (0, .5)}
+                       'k': (0, 1.5)}
 
     lhc_sampler     = scipy.stats.qmc.LatinHypercube(d = 3)
     lhc_samples     = lhc_sampler.random(n = lhs_n)
@@ -171,78 +171,25 @@ def main(auger_ID, lhs_n = 100000):
     # mask out where Kla < Kre
     lhc_samples     = lhc_samples[lhc_samples[:, 0] > lhc_samples[:, 1]]
 
-    # prepare arrays to store performance results
-    lhc_rmse_C      = np.zeros(lhc_samples.shape[0])
-    lhc_rmse_DBD    = np.zeros(lhc_samples.shape[0])
-    lhc_rmse_Z      = np.zeros(lhc_samples.shape[0])
+    # run the callibration loop in parallel
+    results = []
+    for i in tqdm(range(0, len(lhc_samples), chunk_size), desc="Chunks"):
+        chunk = lhc_samples[i:i + chunk_size]
+        chunk_results = Parallel(n_jobs=nodes, backend="loky", batch_size="auto")(
+            delayed(run_single_iteration)(
+                sample, oim, timesteps, veg_params, hwl_df, avg_tide,
+                sed_om_frac, auger_soil, rtk.loc[auger_ID]['z_TAW'], use_Julia=True
+            ) for sample in chunk
+        )
+        results.extend(chunk_results)
+        gc.collect()  # Force garbage collection between chunks
 
-    # callibrate K labile
-    for i, (Kla, Kre, k) in tqdm(enumerate(lhc_samples), total=lhc_samples.shape[0]):
+    # 3. Unpack the list of tuples into your results arrays
+    results = np.array(results)
 
-        # copy the oim instance to not overwrite the original
-        oim_call    = oim.copy()
-
-        for timestep in range(timesteps + 1):
-            # set years
-            t0 = datetime(2026 - timesteps + (timestep - 1), 1, 1)
-            t1 = datetime(2026 - timesteps + (timestep - 1), 12, 31)
-
-            # update max biomass
-            oim_call.Bmax   = 1.45 * oim.surface - 5.58
-
-            # set decay coefficients
-            oim_call.Kla0   = Kla
-            oim_call.Kre0   = Kre
-
-            # set vegetation parameters depending on the surface
-            if oim_call.surface > 5.05:
-                rootshoot, turnover, gamma = veg_params["Elytrigia"]
-            elif oim_call.surface > 4.8:
-                rootshoot, turnover, gamma = veg_params["Bolboschoenus"]
-            else:
-                rootshoot, turnover, gamma = veg_params["Tripolium"]
-            oim_call.gamma = oim_call.kappa = oim_call.lamda = gamma
-            oim_call.root_to_shoot = rootshoot
-            oim_call.turnover = turnover
-
-            # run model
-            oim_call.biomass()
-            oim_call.organic_carbon_decay()
-            oim_call.marsed(
-                hwls        = hwl_df.loc[t0:t1].values.flatten(),
-                avg_tide_t  = avg_tide.index,
-                avg_tide_h  = avg_tide.avg_H,
-                k           = k,
-                sed_om_frac =sed_om_frac,
-                f_Cla       = .40,
-            )
-            oim_call.update_layers()
-
-
-        # retrieve organic carbon
-        C                   = 100 * oim_call.get_C() / oim_call.mass
-
-        # interpolate the simulated C densities to the observed densities
-        C_sim               = np.interp(auger_soil["depth"] / 100, oim_call.d, C)
-
-        # calculate the root mean square error
-        lhc_rmse_C[i]       = np.sqrt(np.mean(np.square(C_sim - auger_soil["C_percentage"])))
-
-        # retrieve dry bulk density
-        dbd_sim             = np.interp(auger_soil["depth"] / 100, oim_call.d, oim_call.get_dbd())
-
-        # calculate the root mean square error
-        lhc_rmse_DBD[i]     = np.sqrt(np.mean(np.square(dbd_sim - 1000 * auger_soil["DBD"])))
-
-        # calculate the root mean square error on the elevation
-        lhc_rmse_Z[i]     = np.sqrt(np.mean(np.square(oim_call.surface - rtk.loc[auger_ID]['z_TAW'])))
-
-        # plot organic carbon for all callibration runs
-        # axs.plot(C, -oim_call.d, ls='-', c=matplotlib.cm.plasma(Kre/.0003), alpha = .1, zorder = 0)
-
-        #if i % 1000:
-        #    gc.collect()
-
+    lhc_rmse_C = results[:, 0]
+    lhc_rmse_DBD = results[:, 1]
+    lhc_rmse_Z = results[:, 2]
 
 
     #%% find optimal Kla, Kre and sedimentation using Bayesian likelihood maximization
@@ -267,9 +214,8 @@ def main(auger_ID, lhs_n = 100000):
     lhc_samples     = lhc_samples[np.argsort(L),:]
     L               = L[np.argsort(L)]
 
-    # create colormap from [0,0,0,0] to maroon
+    # create colormap from [0,0,0,0] to gold
     cmap = matplotlib.colors.LinearSegmentedColormap.from_list('black to golden', [(0,0,0,0.1), (1.0, 0.65, 0.0, .5), (1.0, 0.85, 0.0, 1.),(1,1,1,1)])
-    #cmap = matplotlib.colors.LinearSegmentedColormap.from_list('white to maroon', [(1,1,1,0), (0.5, 0, 0, .5),(0,0,0,1)])
     hb1 = axs_L[0].scatter(lhc_samples[:, 0], lhc_samples[:, 2], c=L, cmap=cmap, vmin=0, vmax=np.max(L), s = 5)
     hb2 = axs_L[1].scatter(lhc_samples[:, 0], lhc_samples[:, 1], c=L, cmap=cmap, vmin=0, vmax=np.max(L), s = 5)
 
@@ -306,15 +252,15 @@ def main(auger_ID, lhs_n = 100000):
         oim.Kre0   = Kre_opt
 
         # set vegetation parameters depending on the surface
-        if oim_call.surface > 5.05:
+        if oim.surface > 5.05:
             rootshoot, turnover, gamma = veg_params["Elytrigia"]
-        elif oim_call.surface > 4.8:
+        elif oim.surface > 4.8:
             rootshoot, turnover, gamma = veg_params["Bolboschoenus"]
         else:
             rootshoot, turnover, gamma = veg_params["Tripolium"]
-        oim_call.gamma = oim_call.kappa = oim_call.lamda = gamma
-        oim_call.root_to_shoot = rootshoot
-        oim_call.turnover = turnover
+        oim.gamma = oim.kappa = oim.lamda = gamma
+        oim.root_to_shoot = rootshoot
+        oim.turnover = turnover
 
         # run model
         oim.biomass()
@@ -351,7 +297,7 @@ def main(auger_ID, lhs_n = 100000):
 
     #%% save plots
 
-    #fig.savefig(f'/Users/ignace/Documents/WETCOAST/model/OIMAS-N/callibration_output/{auger_ID}_call_sedcomp_125per.png')
+    #fig.savefig(f'/Users/ignace/Documents/WETCOAST/model/OIMAS-N/output/{auger_ID}_call_sedcomp_125per.png')
     fig.savefig(f'/Users/ignace/Documents/WETCOAST/model/OIMAS-N/Saefthinge/callibration_output/{auger_ID}_call.png')
 
     cal_path = f'/Users/ignace/Documents/WETCOAST/model/OIMAS-N/Saefthinge/callibration_output/callibrated_params.csv'
@@ -361,4 +307,4 @@ def main(auger_ID, lhs_n = 100000):
 
 if __name__ == "__main__":
     args = parse_args()
-    main(args.auger_id, lhs_n = args.lhs_n)
+    main(args.auger_id, lhs_n = args.lhs_n, nodes = args.nodes, chunk_size = args.chunk_size)

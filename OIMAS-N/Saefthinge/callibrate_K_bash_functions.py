@@ -3,7 +3,7 @@ from datetime import datetime
 import numpy as np
 
 
-def run_single_iteration(sample, oim_template, timesteps, veg_params, hwl_df, avg_tide, sed_om_frac, auger_soil):
+def run_single_iteration(sample, oim_template, timesteps, veg_params, hwl_df, avg_tide, sed_om_frac, auger_soil, rtk_z_taw, use_Julia = False):
     Kla, Kre, k = sample
     # Every worker gets its own fresh copy
     oim_call = oim_template.copy()
@@ -36,15 +36,21 @@ def run_single_iteration(sample, oim_template, timesteps, veg_params, hwl_df, av
             k=k,
             sed_om_frac=sed_om_frac,
             f_Cla=.40,
+            use_Julia = use_Julia
         )
         oim_call.update_layers()
 
-    # Calculations
+    # 1. RMSE for Carbon
     C = 100 * oim_call.get_C() / oim_call.mass
     C_sim = np.interp(auger_soil["depth"] / 100, oim_call.d, C)
     rmse_C = np.sqrt(np.mean(np.square(C_sim - auger_soil["C_percentage"])))
 
+    # 2. RMSE for Dry Bulk Density
     dbd_sim = np.interp(auger_soil["depth"] / 100, oim_call.d, oim_call.get_dbd())
     rmse_DBD = np.sqrt(np.mean(np.square(dbd_sim - 1000 * auger_soil["DBD"])))
 
-    return rmse_C, rmse_DBD
+    # 3. RMSE for Elevation (Z)
+    # Assuming oim_call.surface is the final simulated elevation
+    rmse_Z = np.abs(oim_call.surface - rtk_z_taw)
+
+    return rmse_C, rmse_DBD, rmse_Z
