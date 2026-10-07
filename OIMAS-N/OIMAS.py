@@ -194,8 +194,6 @@ class OIMAS_N(object):
         self.z += delta
         self.surface = initial_surface
 
-        # initialize age horizons list
-        self.age_horizons = [{'t': self.t, 'cum_min_mass': 0.0}]
 
     def calculate_buoyant_weight(self):
 
@@ -230,6 +228,7 @@ class OIMAS_N(object):
         if self.compaction_method == 'Gutierrez':
             for _ in range(iterations):
 
+                self.calculate_buoyant_weight()
                 # void ratio in function of compaction
                 self.sigma          = np.maximum(self.buoy_weight, 1e-6)
                 E_min               = self.E0_min - self.CI_min * np.log(self.sigma/self.sigma_ref_min)
@@ -303,8 +302,9 @@ class OIMAS_N(object):
             self.Cre            = np.concatenate([np.array([self.Cre[0]/2, self.Cre[0]/2]), self.Cre[1:]])
             self.thickness      = np.concatenate([np.array([self.thickness[0]/2, self.thickness[0]/2]), self.thickness[1:]])
             self.bbg            = np.concatenate([np.array([self.bbg[0] / 2]), np.array([self.bbg[0] / 2]), self.bbg[1:]])
+            self.bbg_per_layer  = np.concatenate([np.array([self.bbg_per_layer[0] / 2]), np.array([self.bbg_per_layer[0] / 2]), self.bbg_per_layer[1:]])
 
-            self.mass           = self.min_mass + self.om_mass
+            self.mass           = self.min_mass + self.om_mass + + self.bbg_per_layer
             self.n_layers       = len(self.thickness)
 
 
@@ -372,7 +372,6 @@ class OIMAS_N(object):
         # evolution of labile carbon pool (kg m^-2)
         Cla_evol                = -Kla * self.Cla * self.dt + self.Mbg_int * self.chi_la * self.f_C
         self.Cla                += Cla_evol
-        self.Cla                += Cla_evol
         self.Cla                = np.maximum(self.Cla, 0)
 
         # evolution of recalcitrant carbon pool (kg m^-2)
@@ -406,7 +405,6 @@ class OIMAS_N(object):
         #   - buoyant weight (self.buoy_weight)
         #   - the compaction itself
         # update buoyant weight
-        self.calculate_buoyant_weight()
         self.compaction()
 
         # update timestep
@@ -486,10 +484,55 @@ class OIMAS_N(object):
         self.Cre[0]             += C * (1 - f_Cla)
 
         # update the total mass
-        self.mass               = self.om_mass + self.min_mass
+        self.mass               = self.om_mass + self.min_mass + self.bbg_per_layer
 
-        # record new age horizon using cumulative mineral mass (conservative)
-        self.age_horizons.append({'t': self.t, 'cum_min_mass': np.sum(self.min_mass)})
+
+    def erosion(self, erosion_mass):
+        """
+        method to remove sediment from the top
+
+        :param erosion (float): removed total mass (kg m^-2)
+        """
+
+        attributes_to_update = ["om_mass", "min_mass", "Cla", "Cre",
+                     "thickness", "bbg_per_layer"]
+
+        while erosion_mass > 0.001:
+            # avoid eroding everything
+            if len(self.thickness) == 1:
+                #print("We won't erode the last layer for numerical stability.")
+                break
+
+            # calculate how much of the erosion contributes to the top layer
+            solid_mass_top_layer    = self.min_mass[0] + self.om_mass[0]
+            erosion_top_layer       = min(erosion_mass, solid_mass_top_layer)
+            erosion_mass            -= erosion_top_layer
+
+            # get solid top layer before erosion
+            solid_to_keep_top_layer = 1-(erosion_top_layer/solid_mass_top_layer)
+
+            # update the mass of the top layers
+            for attribute in attributes_to_update:
+                arr = getattr(self, attribute)
+                arr[0] = arr[0] * solid_to_keep_top_layer
+                setattr(self, attribute, arr)
+
+
+            # remove empty layers
+            if self.om_mass[0] < 0.001 and self.min_mass[0] < 0.001:
+                for attribute in attributes_to_update:
+                    setattr(self, attribute, getattr(self, attribute)[1:])
+
+                self.n_layers -= 1
+
+        # update the total mass
+        self.bbg                = self.bbg_per_layer / self.thickness
+        self.mass               = self.om_mass + self.min_mass + self.bbg_per_layer
+
+        self.update_geometry()  # surface, d, z
+        self.calculate_buoyant_weight()
+        self.compaction()
+
 
     def get_dbd(self):
         """
@@ -506,15 +549,6 @@ class OIMAS_N(object):
         """
 
         return self.Cre + self.Cla
-
-    def get_age_horizons(self):
-        cum_min_mass = np.cumsum(self.min_mass[::-1])  # accumulate bottom-up
-        result = []
-        for h in self.age_horizons:
-            idx = min(np.searchsorted(cum_min_mass, h['cum_min_mass']), len(self.z) - 1)
-            z = self.z[::-1][idx]  # index into flipped z array
-            result.append({'t': h['t'], 'z': z})
-        return result
 
     def copy(self):
         """
