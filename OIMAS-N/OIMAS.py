@@ -5,6 +5,7 @@ import sys
 
 
 from julia import Main as Julia
+
 Julia.include(f'{os.environ["MARSEDPATH"]}/MARSED.jl')
 
 class OIMAS_N(object):
@@ -19,7 +20,7 @@ class OIMAS_N(object):
                  Bmax = 2.5, root_to_shoot = 1, turnover = 0.5,
                  gamma = .11, kappa = .11, lamda = .11,
                  Kla0 = .17, Kre0 = .001, mu_la = 1e6, mu_re = 1e6,
-                 chi_la = .32, chi_re = .5,
+                 chi_la = .32, chi_re = .5, f_litter = 0.18,
                  f_C = .52):
 
         """
@@ -114,8 +115,9 @@ class OIMAS_N(object):
         self.chi_la         = chi_la                # fraction of mortality routed to labile-fast carbon pool
         self.chi_re         = chi_re                # fraction of mortality routed to labile-slow carbon pool
         self.f_C            = f_C                   # carbon fraction of dry biomass (dimensionless)
+        self.f_litter       = f_litter              # fraction of agb that contributes to sediment om through litterfal
 
-    def initialize_layers(self, init_min_mass, init_om_mass, f_Cla = None, initial_surface = 0.0, set_bbg = False, bbg = None):
+    def initialize_layers(self, init_min_mass, init_om_mass, f_Cla = None, initial_surface = 0.0, set_bbg = False, bbg = None, autochthonuous_fraction=0.0):
         """
         Initialize the layers with mineral and organic masses.
 
@@ -143,6 +145,8 @@ class OIMAS_N(object):
         C                   = self.f_C * self.om_mass
         self.Cla            = f_Cla * C
         self.Cre            = (1 - f_Cla) * C
+        self.Cla_auto       = self.Cla * autochthonuous_fraction
+        self.Cre_auto       = self.Cre * autochthonuous_fraction
 
         # total mass
         self.mass           = self.min_mass + self.om_mass
@@ -300,6 +304,8 @@ class OIMAS_N(object):
             self.om_mass        = np.concatenate([np.array([self.om_mass[0]/2, self.om_mass[0]/2]), self.om_mass[1:]])
             self.Cla            = np.concatenate([np.array([self.Cla[0]/2, self.Cla[0]/2]), self.Cla[1:]])
             self.Cre            = np.concatenate([np.array([self.Cre[0]/2, self.Cre[0]/2]), self.Cre[1:]])
+            self.Cla_auto       = np.concatenate([np.array([self.Cla_auto[0]/2, self.Cla_auto[0]/2]), self.Cla_auto[1:]])
+            self.Cre_auto       = np.concatenate([np.array([self.Cre_auto[0]/2, self.Cre_auto[0]/2]), self.Cre_auto[1:]])
             self.thickness      = np.concatenate([np.array([self.thickness[0]/2, self.thickness[0]/2]), self.thickness[1:]])
             self.bbg            = np.concatenate([np.array([self.bbg[0] / 2]), np.array([self.bbg[0] / 2]), self.bbg[1:]])
             self.bbg_per_layer  = np.concatenate([np.array([self.bbg_per_layer[0] / 2]), np.array([self.bbg_per_layer[0] / 2]), self.bbg_per_layer[1:]])
@@ -374,10 +380,27 @@ class OIMAS_N(object):
         self.Cla                += Cla_evol
         self.Cla                = np.maximum(self.Cla, 0)
 
+        # hdead above ground biomass
+        self.Cla[0]           += self.Agb * self.f_litter * self.chi_la * self.f_C
+
+
         # evolution of recalcitrant carbon pool (kg m^-2)
         Cre_evol                = -Kre * self.Cre * self.dt + self.Mbg_int * self.chi_re * self.f_C
         self.Cre                += Cre_evol
         self.Cre                = np.maximum(self.Cre, 0)
+
+        self.Cre[0]           += self.Agb * self.f_litter * self.chi_re * self.f_C
+
+
+        # evolution of autochtonous carbon pool (kg m^-2)
+        self.Cla_auto           += -Kla * self.Cla_auto * self.dt + self.Mbg_int * self.chi_la * self.f_C
+        self.Cre_auto           += -Kre * self.Cre_auto * self.dt + self.Mbg_int * self.chi_re * self.f_C
+        self.Cla_auto           = np.maximum(self.Cla_auto, 0)
+        self.Cre_auto           = np.maximum(self.Cre_auto, 0)
+
+        self.Cla_auto[0]           += self.Agb * self.f_litter * self.chi_la * self.f_C
+        self.Cre_auto[0]           += self.Agb * self.f_litter * self.chi_re * self.f_C
+
 
         # evolution of organic matter (kg om m^-2 timestep-1)
         self.om_evol            = (Cre_evol + Cla_evol) / self.f_C
@@ -467,7 +490,7 @@ class OIMAS_N(object):
 
         :param sedimentation_om (float): added organic matter through sedimenation (kg m^-2)
         :param sedimentation_min (float): added mineral sediment through sedimenation (kg m^-2)
-        :param f_Ca (float): portion of initial carbon pool that is labile
+        :param f_Cla (float): portion of initial carbon pool that is labile
         """
 
         # update the mass of the top layers
@@ -494,8 +517,9 @@ class OIMAS_N(object):
         :param erosion (float): removed total mass (kg m^-2)
         """
 
-        attributes_to_update = ["om_mass", "min_mass", "Cla", "Cre",
-                     "thickness", "bbg_per_layer"]
+        attributes_to_update = ["om_mass", "min_mass",
+                                "Cla", "Cre", "Cla_auto","Cre_auto",
+                                "thickness", "bbg_per_layer"]
 
         while erosion_mass > 0.001:
             # avoid eroding everything
@@ -549,6 +573,14 @@ class OIMAS_N(object):
         """
 
         return self.Cre + self.Cla
+
+    def get_C_auto(self):
+        """
+        method tho retrieve dry bulk density
+        :return: dry bulk density (kg m^-3)
+        """
+
+        return self.Cre_auto + self.Cla_auto
 
     def copy(self):
         """
